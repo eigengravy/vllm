@@ -6,6 +6,10 @@ import time
 from collections import defaultdict
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
+from attr import dataclass
+import json
+import os
+import datetime
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
@@ -41,6 +45,78 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+@dataclass
+class SchedulerLogData:
+    step: int
+    start_ts: float
+    end_ts: float
+    running: set[str]
+    waiting: set[str]
+    scheduled_new_reqs: set[str]
+    scheduled_resumed_reqs: set[str]
+    scheduled_running_reqs: set[str]
+    preempted_reqs: set[str]
+
+
+class SchedulerLogger:
+    def __init__(self) -> None:
+        self.logs: list[SchedulerLogData] = []
+        self.step = 0
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+        self.path = os.path.expanduser(f"~/vllm/scheduler_logging/{timestamp}.json")
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+    def log(
+        self,
+        start_ts: float,
+        end_ts: float,
+        running: Iterable[Request],
+        waiting: Iterable[Request],
+        scheduled_new_reqs: Iterable[Request],
+        scheduled_resumed_reqs: Iterable[Request],
+        scheduled_running_reqs: Iterable[Request],
+        preempted_reqs: Iterable[Request],
+    ) -> None:
+        self.step += 1
+        log_data = SchedulerLogData(
+            step=self.step,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            running={req.request_id for req in running},
+            waiting={req.request_id for req in waiting},
+            scheduled_new_reqs={req.request_id for req in scheduled_new_reqs},
+            scheduled_resumed_reqs={req.request_id for req in scheduled_resumed_reqs},
+            scheduled_running_reqs={req.request_id for req in scheduled_running_reqs},
+            preempted_reqs={req.request_id for req in preempted_reqs},
+        )
+        self.logs.append(log_data)
+
+    def clear(self) -> None:
+        self.logs = []
+
+    def write(self) -> None:
+        def log_to_serializable_dict(log: SchedulerLogData) -> dict[str, Any]:
+            return {
+                "step": log.step,
+                "start_ts": log.start_ts,
+                "end_ts": log.end_ts,
+                "running": list(log.running),
+                "waiting": list(log.waiting),
+                "scheduled_new_reqs": list(log.scheduled_new_reqs),
+                "scheduled_resumed_reqs": list(log.scheduled_resumed_reqs),
+                "scheduled_running_reqs": list(log.scheduled_running_reqs),
+                "preempted_reqs": list(log.preempted_reqs),
+            }
+
+        # Atomic write with flush/fsync
+        temp_path = self.path + ".tmp"
+        with open(temp_path, "w") as f:
+            json.dump([log_to_serializable_dict(log) for log in self.logs], f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(temp_path, self.path)
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -62,7 +138,7 @@ class Scheduler(SchedulerInterface):
         self.log_stats = log_stats
         self.structured_output_manager = structured_output_manager
         self.is_encoder_decoder = vllm_config.model_config.is_encoder_decoder
-
+        self.scheduler_logger = SchedulerLogger()
         # include_finished_set controls whether a separate set of finished
         # request ids should be included in the EngineCoreOutputs returned
         # by update_from_outputs(). This is currently used in the multi-engine
@@ -89,9 +165,9 @@ class Scheduler(SchedulerInterface):
                 "Multiple KV cache groups are not currently supported "
                 "with KV connectors"
             )
-            assert not self.is_encoder_decoder, (
-                "Encoder-decoder models are not currently supported with KV connectors"
-            )
+            assert (
+                not self.is_encoder_decoder
+            ), "Encoder-decoder models are not currently supported with KV connectors"
             self.connector = KVConnectorFactory.create_connector(
                 config=self.vllm_config, role=KVConnectorRole.SCHEDULER
             )
@@ -659,6 +735,17 @@ class Scheduler(SchedulerInterface):
             self.kv_event_publisher.publish(batch)
 
         self._update_after_schedule(scheduler_output)
+
+        self.scheduler_logger.log(
+            start_ts=scheduled_timestamp,
+            end_ts=time.monotonic(),
+            running=self.running,
+            waiting=self.waiting,
+            scheduled_new_reqs=scheduled_new_reqs,
+            scheduled_resumed_reqs=scheduled_resumed_reqs,
+            scheduled_running_reqs=scheduled_running_reqs,
+            preempted_reqs=preempted_reqs,
+        )
         return scheduler_output
 
     def _update_after_schedule(
@@ -1272,6 +1359,8 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        if self.scheduler_logger:
+            self.scheduler_logger.write()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
