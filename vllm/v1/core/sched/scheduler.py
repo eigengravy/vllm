@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import signal
+import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -59,12 +61,28 @@ class SchedulerLogData:
 
 
 class SchedulerLogger:
+    _signals_registered = False  # <-- class-level guard
+
     def __init__(self) -> None:
-        self.logs: list[SchedulerLogData] = []
+        self.logs = []
         self.step = 0
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
         self.path = os.path.expanduser(f"~/vllm/scheduler_logging/{timestamp}.json")
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+
+        # Register signal handlers only once (for the whole process)
+        if not SchedulerLogger._signals_registered:
+
+            def handle_signal(sig, frame):
+                logger.debug(f"\nReceived signal {sig}, writing scheduler logs...")
+                try:
+                    self.write()
+                    logger.debug(f"Logs written to {self.path}")
+                except Exception as e:
+                    logger.error(f"Error writing logs: {e}")
+
+            signal.signal(signal.SIGTERM, handle_signal)
+            signal.signal(signal.SIGINT, handle_signal)
+            SchedulerLogger._signals_registered = True
 
     def log(
         self,
@@ -108,6 +126,7 @@ class SchedulerLogger:
                 "preempted_reqs": list(log.preempted_reqs),
             }
 
+        logger.debug(f"Writing scheduler logs to {self.path}")
         # Atomic write with flush/fsync
         temp_path = self.path + ".tmp"
         with open(temp_path, "w") as f:
@@ -1359,8 +1378,6 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
-        if self.scheduler_logger:
-            self.scheduler_logger.write()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
