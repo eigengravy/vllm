@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-import signal
-import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -44,6 +42,7 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
+
 logger = init_logger(__name__)
 
 
@@ -61,28 +60,25 @@ class SchedulerLogData:
 
 
 class SchedulerLogger:
-    _signals_registered = False  # <-- class-level guard
-
     def __init__(self) -> None:
-        self.logs = []
+        self.logs: list[SchedulerLogData] = []
         self.step = 0
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-        self.path = os.path.expanduser(f"~/vllm/scheduler_logging/{timestamp}.json")
+        self.path = os.path.expanduser(f"~/vllm/scheduler_logging/{timestamp}.jsonl")
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
-        # # Register signal handlers only once (for the whole process)
-        # if not SchedulerLogger._signals_registered:
-
-        #     def handle_signal(sig, frame):
-        #         logger.debug(f"\nReceived signal {sig}, writing scheduler logs...")
-        #         try:
-        #             self.write()
-        #             logger.debug(f"Logs written to {self.path}")
-        #         except Exception as e:
-        #             logger.error(f"Error writing logs: {e}")
-
-        #     signal.signal(signal.SIGTERM, handle_signal)
-        #     signal.signal(signal.SIGINT, handle_signal)
-        #     SchedulerLogger._signals_registered = True
+    def _to_serializable_dict(self, log: SchedulerLogData) -> dict[str, Any]:
+        return {
+            "step": log.step,
+            "start_ts": log.start_ts,
+            "end_ts": log.end_ts,
+            "running": list(log.running),
+            "waiting": list(log.waiting),
+            "scheduled_new_reqs": list(log.scheduled_new_reqs),
+            "scheduled_resumed_reqs": list(log.scheduled_resumed_reqs),
+            "scheduled_running_reqs": list(log.scheduled_running_reqs),
+            "preempted_reqs": list(log.preempted_reqs),
+        }
 
     def log(
         self,
@@ -109,31 +105,14 @@ class SchedulerLogger:
         )
         self.logs.append(log_data)
 
-    def clear(self) -> None:
-        self.logs = []
-
-    def write(self) -> None:
-        def log_to_serializable_dict(log: SchedulerLogData) -> dict[str, Any]:
-            return {
-                "step": log.step,
-                "start_ts": log.start_ts,
-                "end_ts": log.end_ts,
-                "running": list(log.running),
-                "waiting": list(log.waiting),
-                "scheduled_new_reqs": list(log.scheduled_new_reqs),
-                "scheduled_resumed_reqs": list(log.scheduled_resumed_reqs),
-                "scheduled_running_reqs": list(log.scheduled_running_reqs),
-                "preempted_reqs": list(log.preempted_reqs),
-            }
-
-        logger.debug(f"Writing scheduler logs to {self.path}")
-        # Atomic write with flush/fsync
-        temp_path = self.path + ".tmp"
-        with open(temp_path, "w") as f:
-            json.dump([log_to_serializable_dict(log) for log in self.logs], f, indent=4)
-            f.flush()
-            os.fsync(f.fileno())
-        os.rename(temp_path, self.path)
+        try:
+            with open(self.path, "a") as f:
+                json.dump(self._to_serializable_dict(log_data), f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception:
+            logger.exception("Failed to append scheduler log to %s", self.path)
 
 
 class Scheduler(SchedulerInterface):
@@ -1378,7 +1357,6 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
-        self.scheduler_logger.write()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -1499,6 +1477,7 @@ class Scheduler(SchedulerInterface):
         """
         affected_req_ids: set[str] = set()
         total_affected_tokens = 0
+
         # If a block is invalid and shared by multiple requests in the batch,
         # these requests must be rescheduled, but only the first will recompute
         # it. This set tracks blocks already marked for recomputation.
