@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import queue
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterable
@@ -47,7 +49,7 @@ logger = init_logger(__name__)
 
 
 @dataclass
-class SchedulerLogData:
+class SchedulerLoggerData:
     step: int
     start_ts: float
     end_ts: float
@@ -61,17 +63,25 @@ class SchedulerLogData:
 
 class SchedulerLogger:
     def __init__(self) -> None:
-        self.logs: list[SchedulerLogData] = []
+        self.logs: list[SchedulerLoggerData] = []
         self.step = 0
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
         self.path = os.path.expanduser(f"~/vllm/scheduler_logging/{timestamp}.jsonl")
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
-    def _to_serializable_dict(self, log: SchedulerLogData) -> dict[str, Any]:
+        self._queue: queue.Queue[dict[str, Any]] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, name="SchedulerLoggerThread", daemon=True
+        )
+        self._writer_thread.start()
+
+    def _to_serializable_dict(self, log: SchedulerLoggerData) -> dict[str, Any]:
         return {
             "step": log.step,
             "start_ts": log.start_ts,
             "end_ts": log.end_ts,
+            "duration_ms": round((log.end_ts - log.start_ts) * 1000, 3),
             "running": list(log.running),
             "waiting": list(log.waiting),
             "scheduled_new_reqs": list(log.scheduled_new_reqs),
@@ -80,19 +90,32 @@ class SchedulerLogger:
             "preempted_reqs": list(log.preempted_reqs),
         }
 
+    def _writer_loop(self):
+        with open(self.path, "a", encoding="utf-8") as f:
+            while not self._stop_event.is_set() or not self._queue.empty():
+                try:
+                    record = self._queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+                json.dump(record, f, ensure_ascii=False)
+                f.write("\n")
+                self._queue.task_done()
+            f.flush()
+            os.fsync(f.fileno())
+
     def log(
         self,
         start_ts: float,
         end_ts: float,
-        running: Iterable[Request],
-        waiting: Iterable[Request],
-        scheduled_new_reqs: Iterable[Request],
-        scheduled_resumed_reqs: Iterable[Request],
-        scheduled_running_reqs: Iterable[Request],
-        preempted_reqs: Iterable[Request],
+        running: Iterable[Any],
+        waiting: Iterable[Any],
+        scheduled_new_reqs: Iterable[Any],
+        scheduled_resumed_reqs: Iterable[Any],
+        scheduled_running_reqs: Iterable[Any],
+        preempted_reqs: Iterable[Any],
     ) -> None:
         self.step += 1
-        log_data = SchedulerLogData(
+        log_data = SchedulerLoggerData(
             step=self.step,
             start_ts=start_ts,
             end_ts=end_ts,
@@ -105,14 +128,12 @@ class SchedulerLogger:
         )
         self.logs.append(log_data)
 
-        try:
-            with open(self.path, "a") as f:
-                json.dump(self._to_serializable_dict(log_data), f)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-        except Exception:
-            logger.exception("Failed to append scheduler log to %s", self.path)
+        record = self._to_serializable_dict(log_data)
+        self._queue.put_nowait(record)
+
+    def close(self):
+        self._stop_event.set()
+        self._writer_thread.join(timeout=2)
 
 
 class Scheduler(SchedulerInterface):
@@ -1357,6 +1378,7 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        self.scheduler_logger.close()
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
