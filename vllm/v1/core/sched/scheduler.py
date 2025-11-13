@@ -59,6 +59,7 @@ class SchedulerLoggerData:
     scheduled_resumed_reqs: set[str]
     scheduled_running_reqs: set[str]
     preempted_reqs: set[str]
+    num_scheduled_tokens: dict[str, int]
 
 
 class SchedulerLogger:
@@ -88,6 +89,7 @@ class SchedulerLogger:
             "scheduled_resumed_reqs": list(log.scheduled_resumed_reqs),
             "scheduled_running_reqs": list(log.scheduled_running_reqs),
             "preempted_reqs": list(log.preempted_reqs),
+            "num_scheduled_tokens": log.num_scheduled_tokens,
         }
 
     def _writer_loop(self):
@@ -113,6 +115,7 @@ class SchedulerLogger:
         scheduled_resumed_reqs: Iterable[Any],
         scheduled_running_reqs: Iterable[Any],
         preempted_reqs: Iterable[Any],
+        num_scheduled_tokens: dict[str, int],
     ) -> None:
         self.step += 1
         log_data = SchedulerLoggerData(
@@ -125,6 +128,7 @@ class SchedulerLogger:
             scheduled_resumed_reqs={req.request_id for req in scheduled_resumed_reqs},
             scheduled_running_reqs={req.request_id for req in scheduled_running_reqs},
             preempted_reqs={req.request_id for req in preempted_reqs},
+            num_scheduled_tokens=num_scheduled_tokens,
         )
         self.logs.append(log_data)
 
@@ -764,6 +768,7 @@ class Scheduler(SchedulerInterface):
             scheduled_resumed_reqs=scheduled_resumed_reqs,
             scheduled_running_reqs=scheduled_running_reqs,
             preempted_reqs=preempted_reqs,
+            num_scheduled_tokens=num_scheduled_tokens,
         )
         return scheduler_output
 
